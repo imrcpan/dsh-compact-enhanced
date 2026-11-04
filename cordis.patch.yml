@@ -1,0 +1,8 @@
+# dsh-compact-enhanced bundle layer: mount the queueing compaction commands.
+#
+# The plugin shadows the built-in /compact command while it is mounted, so this
+# row has to load after @deepseek-ai/dsh-command-compact. Bundle layers apply in
+# composition order, and a profile appends a newly installed bundle last.
+- insert:
+    - id: compact-enhanced
+      name: "dsh-compact-enhanced"
