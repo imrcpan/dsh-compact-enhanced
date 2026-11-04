@@ -11,10 +11,16 @@
  *
  * @module dsh-compact-enhanced
  */
+import { randomUUID } from 'node:crypto'
+
 export const name = 'compact-enhanced'
 
-/** The command registry and the compaction seam this plugin wraps. */
-export const inject = ['commands', 'compaction']
+/**
+ * The command registry is global, but the compaction seam is not: agent presets
+ * mount it inside an isolated per-agent group, so this plugin resolves it from
+ * the invoking agent's context at run time instead of waiting for a root service.
+ */
+export const inject = ['commands']
 
 /** Command name that shadows the built-in manual compaction command. */
 const COMPACT = 'compact'
@@ -57,6 +63,25 @@ function delay(ms) {
 /** A synchronous refusal from compactNow means the agent was not idle at the start. */
 function isBusy(error) {
   return typeof error === 'object' && error !== null && error.code === 'busy'
+}
+
+/** Parse a `/compact` line; `/compact-cancel` and every other command return undefined. */
+function parseCompact(line) {
+  const match = /^\/compact(?=$|[\t\n\r ])/u.exec(line)
+  if (match === null) return undefined
+  return { raw: line.slice(match[0].length) }
+}
+
+/** Whether the session log ends inside an unfinished compaction marker pair. */
+function compactionActive(agent) {
+  const log = agent?.session?.log
+  if (!Array.isArray(log)) return false
+  let open = false
+  for (const event of log) {
+    if (event?.type === 'compaction/start') open = true
+    else if (event?.type === 'compaction/end') open = false
+  }
+  return open
 }
 
 /** Map one documented compaction failure to the text the command row shows. */
@@ -114,8 +139,17 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /** Resolve the per-agent compaction seam: presets isolate it below the profile root. */
+  function compactionOf(agent) {
+    const scoped = agent.ctx?.get?.('compaction')
+    return scoped ?? ctx.get('compaction')
+  }
+
   function request(invocation) {
     const agent = invocation.agent
+    if (compactionOf(agent) === undefined) {
+      return { kind: 'error', text: 'Compaction is unavailable: this session has no compaction service.' }
+    }
     const state = stateOf(agent)
     if (state.running !== undefined) {
       return { kind: 'error', text: 'A compaction is already running. Stop it with /compact-cancel before starting another one.' }
@@ -140,7 +174,9 @@ export function apply(ctx, config = {}) {
   /** Start one attempt synchronously so a busy refusal stays distinguishable from a rejection. */
   function begin(agent, state, commandId) {
     const entry = { commandId, controller: new AbortController() }
-    const operation = ctx.compaction.compactNow(agent, entry.controller.signal, commandId)
+    const compaction = compactionOf(agent)
+    if (compaction === undefined) throw new Error('Compaction is unavailable: this session has no compaction service.')
+    const operation = compaction.compactNow(agent, entry.controller.signal, commandId)
     state.running = entry
     Promise.resolve(operation).then((result) => {
       settle(agent, commandId, {
@@ -203,6 +239,13 @@ export function apply(ctx, config = {}) {
       state.running.controller.abort(new Error('compaction cancelled by the user'))
       return { kind: 'success', text: 'Cancelling the running compaction.' }
     }
+    if (agent.status === 'idle' && compactionActive(agent)) {
+      // A compaction started by another command module runs in this agent's
+      // maintenance phase; cancelling the phase aborts it without clearing the
+      // queued inbox work.
+      agent.cancel({ kind: 'user' }, { keepInbox: true })
+      return { kind: 'success', text: 'Cancellation requested for the active compaction.' }
+    }
     return { kind: 'error', text: 'No queued or running compaction to cancel.' }
   }
 
@@ -231,7 +274,33 @@ export function apply(ctx, config = {}) {
         return cancel(invocation.agent)
       },
     }))
+    // Agent presets register their own scoped /compact, which shadows a global
+    // replacement for those agents. Handling the line at the service boundary
+    // makes the queue apply no matter which definition the catalog resolves.
+    const service = ctx.commands
+    const originalExecute = service.execute
+    let sequence = 0
+    const execute = typeof originalExecute !== 'function' ? undefined : async (agent, line, attachments, signal) => {
+      const parsed = parseCompact(line)
+      if (parsed === undefined) return originalExecute.call(service, agent, line, attachments, signal)
+      const commandId = `cmd-compact-enhanced-${randomUUID().slice(0, 8)}-${++sequence}`
+      try {
+        agent.session.append('command/run', {
+          commandId,
+          name: COMPACT,
+          ...(parsed.raw.length === 0 ? {} : { args: parsed.raw }),
+          source: { kind: 'user' },
+        })
+      } catch (error) {
+        ctx.logger.warn('compact-enhanced: command/run append failed: %o', error)
+      }
+      const result = parsed.raw.trim().length > 0 ? { kind: 'error', text: USAGE } : request({ agent, commandId, rawInput: parsed.raw, signal })
+      settle(agent, commandId, result)
+      return { commandId, result }
+    }
+    if (execute !== undefined) service.execute = execute
     return () => {
+      if (execute !== undefined && service.execute === execute) service.execute = originalExecute
       for (const dispose of disposers) dispose()
       for (const state of live) {
         if (state.timer !== undefined) {

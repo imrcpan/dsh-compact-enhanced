@@ -3,12 +3,16 @@ import test from 'node:test'
 import { apply, inject, name } from '../index.js'
 
 /** Mount the plugin against a recording context and a controllable agent. */
-function harness(compactNow, config = {}) {
+function harness(compactNow, config = {}, options = {}) {
   const definitions = new Map()
   let dispose
+  const originalExecute = async () => 'delegated'
   const ctx = {
-    commands: { register: (definition) => { definitions.set(definition.name, definition); return () => definitions.delete(definition.name) } },
-    compaction: { compactNow },
+    commands: {
+      execute: originalExecute,
+      register: (definition) => { definitions.set(definition.name, definition); return () => definitions.delete(definition.name) },
+    },
+    get: (service) => (service === 'compaction' && options.noService !== true ? { compactNow } : undefined),
     effect: (factory) => { dispose = factory() },
     logger: { warn: () => {} },
   }
@@ -17,8 +21,17 @@ function harness(compactNow, config = {}) {
     status: 'idle',
     appended: [],
     idleResolvers: [],
-    session: { append: (type, data) => { agent.appended.push({ type, data }); return { type } } },
+    cancelCalls: [],
+    session: {
+      log: [],
+      append: (type, data) => {
+        agent.appended.push({ type, data })
+        agent.session.log.push({ type, data })
+        return { type }
+      },
+    },
   }
+  agent.cancel = (cause, options) => { agent.cancelCalls.push({ cause, options }) }
   agent.whenIdle = () => (agent.status === 'idle' ? Promise.resolve() : new Promise((resolve) => agent.idleResolvers.push(resolve)))
   agent.goBusy = () => { agent.status = 'running' }
   agent.goIdle = () => {
@@ -31,14 +44,15 @@ function harness(compactNow, config = {}) {
     rawInput,
     signal: new AbortController().signal,
   })
-  return { definitions, dispose: () => dispose(), agent, run }
+  const execute = (line) => ctx.commands.execute(agent, line, [], new AbortController().signal)
+  return { definitions, dispose: () => dispose(), agent, run, execute, ctx }
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 30))
 
 test('exposes the plugin contract', () => {
   assert.equal(name, 'compact-enhanced')
-  assert.deepEqual(inject, ['commands', 'compaction'])
+  assert.deepEqual(inject, ['commands'])
 })
 
 test('starts compaction immediately when the agent is idle', async () => {
@@ -149,6 +163,25 @@ test('reports nothing to cancel', async () => {
   assert.match(result.text, /No queued or running compaction/)
 })
 
+test('cancels a compaction started by another command module', async () => {
+  const { agent, run } = harness(async () => null)
+  agent.session.log.push({ type: 'compaction/start', data: {} })
+  const result = await run('compact-cancel', 'cmd-14b')
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /Cancellation requested/)
+  assert.equal(agent.cancelCalls.length, 1)
+  assert.deepEqual(agent.cancelCalls[0].cause, { kind: 'user' })
+  assert.deepEqual(agent.cancelCalls[0].options, { keepInbox: true })
+})
+
+test('does not cancel while a finished compaction is only history', async () => {
+  const { agent, run } = harness(async () => null)
+  agent.session.log.push({ type: 'compaction/start', data: {} }, { type: 'compaction/end', data: {} })
+  const result = await run('compact-cancel', 'cmd-14c')
+  assert.equal(result.kind, 'error')
+  assert.equal(agent.cancelCalls.length, 0)
+})
+
 test('maps documented compaction failures to human text', async () => {
   const { agent, run } = harness(async () => {
     throw Object.assign(new Error('summarizer exploded'), { name: 'ManualCompactionError', code: 'summary' })
@@ -184,6 +217,53 @@ test('gives up after the configured queue attempts', async () => {
   assert.match(agent.appended.at(-1).data.text, /Compaction is unavailable/)
 })
 
+test('prefers the compaction service isolated inside the agent scope', async () => {
+  const rootCalls = []
+  const scopedCalls = []
+  const { agent, run } = harness(async () => {
+    rootCalls.push(1)
+    return null
+  })
+  agent.ctx = {
+    get: (service) => (service === 'compaction'
+      ? { compactNow: async () => { scopedCalls.push(1); return { shadowedSeqs: [1], shadowedTokenCount: 2 } } }
+      : undefined),
+  }
+  await run('compact', 'cmd-scoped')
+  await flush()
+  assert.deepEqual(rootCalls, [])
+  assert.deepEqual(scopedCalls, [1])
+  assert.equal(agent.appended.at(-1).data.text, 'Compacted 1 history items (~2 tokens).')
+})
+
+test('reports a missing compaction service instead of hanging', async () => {
+  const { agent, run } = harness(async () => null, {}, { noService: true })
+  const result = await run('compact', 'cmd-missing')
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /Compaction is unavailable/)
+})
+
+test('handles /compact at the command service boundary', async () => {
+  const { agent, execute } = harness(async () => ({ shadowedSeqs: [1], shadowedTokenCount: 5 }))
+  const handled = await execute('/compact')
+  assert.ok(handled)
+  assert.match(handled.result.text, /started in the background/)
+  assert.equal(agent.appended[0].type, 'command/run')
+  assert.equal(agent.appended.at(-1).type, 'command/done')
+  await flush()
+  assert.match(agent.appended.at(-1).data.text, /Compacted 1 history items/)
+  assert.equal(await execute('/compact-cancel'), 'delegated')
+  assert.equal(await execute('/other'), 'delegated')
+})
+
+test('restores the command service when the plugin unmounts', async () => {
+  const { dispose, ctx } = harness(async () => null)
+  const wrapped = ctx.commands.execute
+  dispose()
+  assert.notEqual(ctx.commands.execute, wrapped)
+  assert.equal(await ctx.commands.execute({}, '/compact', [], new AbortController().signal), 'delegated')
+})
+
 test('keeps the cancel command when compact is already registered', () => {
   const definitions = new Map()
   const warnings = []
@@ -195,7 +275,7 @@ test('keeps the cancel command when compact is already registered', () => {
         return () => definitions.delete(definition.name)
       },
     },
-    compaction: { compactNow: async () => null },
+    get: (service) => (service === 'compaction' ? { compactNow: async () => null } : undefined),
     effect: (factory) => { factory() },
     logger: { warn: (...args) => warnings.push(args.map(String).join(' ')) },
   }
