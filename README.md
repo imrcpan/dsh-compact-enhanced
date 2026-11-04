@@ -70,6 +70,35 @@ as soon as the handler returns (that is what frees the composer), so the only
 way to report the background outcome on the same row is a second lifecycle edge
 for that id. Clients fold it into the existing row.
 
+## Live status hint
+
+The `/compact` row in the slash menu is a status line, not a fixed sentence. It
+answers "what is happening right now", and appends the current session token
+estimate when there is one:
+
+| state | row text |
+| --- | --- |
+| idle | `Ready · 12.3k token` |
+| waiting for the running turn | `Queued · 12.3k token` |
+| summarizer running | `Compacting · 12.3k token` |
+| no measurable tokens | `Ready`, `Queued` or `Compacting` alone |
+
+The token label uses one decimal place and a fixed `k` unit, Claude Code style:
+`3.9k token`, `12.0k token`, `0.9k token`. It is omitted entirely when the
+estimate is zero or no token meter is reachable, so the row never shows
+`0.0k token`.
+
+The `/compact-cancel` row mirrors the same state: `Cancel the queued
+compaction`, `Cancel the running compaction`, or `No queued or running
+compaction to cancel`.
+
+This is implemented at the command catalog boundary: the plugin replaces the
+`compact` descriptor in `commands.list()`, dropping the built-in definition id
+so the client cannot re-localize the description back to its generic copy, and
+republishes `commands/change` whenever the state changes so the next menu open
+refetches. The trade-off is that the row shows the raw command name and loses
+the built-in localized label and icon; the live status is the point.
+
 ## How it works
 
 - The command registry refuses two global registrations of one name, so the
