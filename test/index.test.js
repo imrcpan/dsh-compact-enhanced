@@ -184,6 +184,27 @@ test('gives up after the configured queue attempts', async () => {
   assert.match(agent.appended.at(-1).data.text, /Compaction is unavailable/)
 })
 
+test('keeps the cancel command when compact is already registered', () => {
+  const definitions = new Map()
+  const warnings = []
+  const ctx = {
+    commands: {
+      register: (definition) => {
+        if (definition.name === 'compact') throw new Error('command "compact" is already registered')
+        definitions.set(definition.name, definition)
+        return () => definitions.delete(definition.name)
+      },
+    },
+    compaction: { compactNow: async () => null },
+    effect: (factory) => { factory() },
+    logger: { warn: (...args) => warnings.push(args.map(String).join(' ')) },
+  }
+  apply(ctx, {})
+  assert.equal(definitions.has('compact'), false)
+  assert.equal(definitions.has('compact-cancel'), true)
+  assert.equal(warnings.some((line) => line.includes('/compact is already registered')), true)
+})
+
 test('shutdown drops the queue and aborts the running attempt', async () => {
   let signal
   const { agent, run, dispose } = harness((owner, attemptSignal) => new Promise((resolve, reject) => {

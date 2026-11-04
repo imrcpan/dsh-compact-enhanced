@@ -207,25 +207,32 @@ export function apply(ctx, config = {}) {
   }
 
   ctx.effect(() => {
-    const disposeCompact = ctx.commands.register({
-      name: COMPACT,
-      description: 'Compact older conversation history, queued while the agent is busy (stop it with /compact-cancel)',
-      handler: (invocation) => {
-        if (invocation.rawInput.trim().length > 0) return { kind: 'error', text: USAGE }
-        return request(invocation)
-      },
-    })
-    const disposeCancel = ctx.commands.register({
+    const disposers = []
+    try {
+      disposers.push(ctx.commands.register({
+        name: COMPACT,
+        description: 'Compact older conversation history, queued while the agent is busy (stop it with /compact-cancel)',
+        handler: (invocation) => {
+          if (invocation.rawInput.trim().length > 0) return { kind: 'error', text: USAGE }
+          return request(invocation)
+        },
+      }))
+    } catch (error) {
+      // The registry refuses a duplicate global name, so a profile that still
+      // mounts @deepseek-ai/dsh-command-compact leaves only the cancel command;
+      // the message names the row to disable.
+      ctx.logger.warn('compact-enhanced: /compact is already registered, disable the command-compact row so this plugin can replace it: %o', error)
+    }
+    disposers.push(ctx.commands.register({
       name: CANCEL,
       description: 'Cancel a queued or running manual compaction',
       handler: (invocation) => {
         if (invocation.rawInput.trim().length > 0) return { kind: 'error', text: CANCEL_USAGE }
         return cancel(invocation.agent)
       },
-    })
+    }))
     return () => {
-      disposeCompact()
-      disposeCancel()
+      for (const dispose of disposers) dispose()
       for (const state of live) {
         if (state.timer !== undefined) {
           clearTimeout(state.timer)
