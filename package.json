@@ -1,0 +1,43 @@
+{
+  "name": "dsh-compact-enhanced",
+  "version": "0.1.0",
+  "description": "Queueing and cancellation for DeepSeek Harness manual compaction.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "example",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "compaction",
+    "queue",
+    "cancel"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imrcpan/dsh-compact-enhanced.git"
+  },
+  "homepage": "https://github.com/imrcpan/dsh-compact-enhanced#readme",
+  "engines": {
+    "node": ">=20.3.0",
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
