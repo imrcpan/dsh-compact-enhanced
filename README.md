@@ -65,19 +65,22 @@ for that id. Clients fold it into the existing row.
   registers its own `/compact` under that name. If a profile still mounts the
   built-in row, the duplicate registration is caught: the plugin logs a warning,
   keeps `/compact-cancel` mounted, and leaves the built-in command in place.
-- The compaction seam is not a profile-root service: agent presets mount it in
-  an isolated per-agent group. The plugin therefore injects only `commands` and
-  resolves `agent.ctx.get('compaction')` per run, falling back to the root
-  service when one exists. Until this was fixed the entry stayed pending
-  forever, waiting for a `compaction` service that only exists inside an agent.
+- The compaction seam is not reachable from the profile root: agent presets mount
+  it inside an isolated per-agent group, and in practice `agent.ctx` does not
+  expose it either. The plugin therefore runs whichever `compact` definition the
+  agent resolves through `commands.find` — normally the preset-mounted command,
+  whose handler closes over the isolated service. That handler runs in the
+  background with the plugin's own `AbortSignal`. When no other definition
+  exists, the plugin falls back to an engine reachable from its own context;
+  when neither is reachable the command reports that compaction is unavailable
+  instead of silently doing nothing.
 - Agent presets also register their own scoped `/compact`, which shadows a
   global replacement for those agents. The plugin handles a `/compact` line at
   the command service boundary, so the queue applies whichever definition the
   catalog resolves, and restores the original `execute` method when the plugin
   unloads.
-- A run calls `compactNow(agent, signal, commandId)` with an `AbortSignal` this
-  plugin owns. Cancellation aborts that signal, which reaches the summarizer
-  request.
+- Cancellation aborts the signal handed to the delegated handler (or to the
+  engine directly), which reaches the summarizer request.
 - A start that races a newly opened turn is retried after
   `retryDelayMs`, up to `maxQueueAttempts` times, before the failure is written
   to the row. Queue state is per agent and in memory.
@@ -146,6 +149,9 @@ has to be copied into the profile's `cordis.patch.yml` by hand.
 - The fallback cancellation relies on the session log ending in an unfinished
   `compaction/start` marker; a compaction that crashed without an end marker is
   reported as active until the next one completes.
+- Delegation depends on the other handler honoring the signal it receives. The
+  preset-mounted command does, because it passes the signal straight to the
+  compaction engine.
 
 ## License
 
