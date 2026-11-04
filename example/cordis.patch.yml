@@ -1,0 +1,8 @@
+# Example profile layer for dsh-compact-enhanced.
+#
+# The package declares dsh.bundle.patch, so a bundle install already applies the
+# equivalent layer. Copy this block into cordis.patch.yml only when the package
+# is installed as a plain dependency.
+- insert:
+    - id: compact-enhanced
+      name: "dsh-compact-enhanced"
