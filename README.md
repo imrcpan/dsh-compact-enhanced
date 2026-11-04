@@ -1,6 +1,6 @@
 # dsh-compact-enhanced
 
-Queueing and cancellation for DeepSeek Harness manual compaction.
+An enhanced compaction plugin for DeepSeek Harness: queueable, cancellable, and with user-friendly status hints.
 
 ## Quick start
 

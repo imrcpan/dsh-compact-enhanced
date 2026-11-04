@@ -1,7 +1,7 @@
 {
   "name": "dsh-compact-enhanced",
   "version": "0.1.0",
-  "description": "Queueing and cancellation for DeepSeek Harness manual compaction.",
+  "description": "An enhanced compaction plugin for DeepSeek Harness: queueable, cancellable, and with user-friendly status hints.",
   "type": "module",
   "main": "index.js",
   "exports": {
