@@ -60,9 +60,11 @@ for that id. Clients fold it into the existing row.
 
 ## How it works
 
-- The plugin registers `compact` under the same name as the built-in command and
-  loads after it, so its definition wins the command shadow. Disabling the
-  plugin restores the built-in command unchanged.
+- The command registry refuses two global registrations of one name, so the
+  bundle layer disables the built-in `command-compact` row and this plugin
+  registers its own `/compact` under that name. If a profile still mounts the
+  built-in row, the duplicate registration is caught: the plugin logs a warning,
+  keeps `/compact-cancel` mounted, and leaves the built-in command in place.
 - A run calls `ctx.compaction.compactNow(agent, signal, commandId)` with an
   `AbortSignal` this plugin owns. Cancellation aborts that signal, which reaches
   the summarizer request.
@@ -97,7 +99,9 @@ dsh plugin --profile web add github:imrcpan/dsh-compact-enhanced
 ```
 
 Restart the profile afterwards; the composition is read at boot. The shipped
-layer ([cordis.patch.yml](./cordis.patch.yml)) inserts the plugin row.
+layer ([cordis.patch.yml](./cordis.patch.yml)) disables the built-in
+`command-compact` row and inserts the plugin row, which is what frees the
+`/compact` name.
 
 ### Install from a checkout
 
@@ -122,6 +126,10 @@ has to be copied into the profile's `cordis.patch.yml` by hand.
   work, because the queue cannot know what the next idle check will find.
 - Cancellation reporting is immediate, but the final row settles when the
   compaction engine returns from the aborted request.
+- Disabling this plugin row while its bundle layer is still enabled leaves no
+  `/compact` at all, because that layer already disabled the built-in command.
+  Re-enable the `command-compact` row in Plugins to get the built-in command
+  back.
 
 ## License
 
