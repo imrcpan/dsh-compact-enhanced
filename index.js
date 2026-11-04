@@ -19,8 +19,17 @@ export const inject = ['commands', 'compaction']
 /** Command name that shadows the built-in manual compaction command. */
 const COMPACT = 'compact'
 
+/** Command name that stops a queued or running compaction. */
+const CANCEL = 'compact-cancel'
+
 /** Reject any argument to the command, matching the built-in contract. */
 const USAGE = 'Usage: /compact (no arguments)'
+
+/** Reject any argument to the cancel command. */
+const CANCEL_USAGE = 'Usage: /compact-cancel (no arguments)'
+
+/** Result wording shared by both cancellation paths. */
+const CANCELLED_TEXT = 'Compaction cancelled.'
 
 /** How long the queue waits before retrying a start that raced a new turn. */
 const DEFAULT_RETRY_DELAY_MS = 250
@@ -109,10 +118,10 @@ export function apply(ctx, config = {}) {
     const agent = invocation.agent
     const state = stateOf(agent)
     if (state.running !== undefined) {
-      return { kind: 'error', text: 'A compaction is already running. Wait for it to finish before starting another one.' }
+      return { kind: 'error', text: 'A compaction is already running. Stop it with /compact-cancel before starting another one.' }
     }
     if (state.pending !== undefined) {
-      return { kind: 'error', text: 'A compaction is already queued; it starts when the current turn ends.' }
+      return { kind: 'error', text: 'A compaction is already queued; stop it with /compact-cancel or wait for the current turn to end.' }
     }
     const entry = { commandId: invocation.commandId, cancelled: false }
     state.pending = entry
@@ -142,7 +151,10 @@ export function apply(ctx, config = {}) {
         ...(result === null || result === undefined || result.summarySeq === undefined ? {} : { sourceEventSeq: result.summarySeq }),
       })
     }, (error) => {
-      settle(agent, commandId, { kind: 'error', text: failureText(error) })
+      settle(agent, commandId, {
+        kind: 'error',
+        text: entry.controller.signal.aborted ? CANCELLED_TEXT : failureText(error),
+      })
     }).finally(() => {
       if (state.running === entry) state.running = undefined
     })
@@ -173,17 +185,47 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /** Stop the queued request or abort the running attempt for one agent. */
+  function cancel(agent) {
+    const state = stateOf(agent)
+    if (state.pending !== undefined) {
+      const entry = state.pending
+      state.pending = undefined
+      entry.cancelled = true
+      if (state.timer !== undefined) {
+        clearTimeout(state.timer)
+        state.timer = undefined
+      }
+      settle(agent, entry.commandId, { kind: 'error', text: CANCELLED_TEXT })
+      return { kind: 'success', text: 'Cancelled the queued compaction.' }
+    }
+    if (state.running !== undefined) {
+      state.running.controller.abort(new Error('compaction cancelled by the user'))
+      return { kind: 'success', text: 'Cancelling the running compaction.' }
+    }
+    return { kind: 'error', text: 'No queued or running compaction to cancel.' }
+  }
+
   ctx.effect(() => {
-    const dispose = ctx.commands.register({
+    const disposeCompact = ctx.commands.register({
       name: COMPACT,
-      description: 'Compact older conversation history, queued while the agent is busy',
+      description: 'Compact older conversation history, queued while the agent is busy (stop it with /compact-cancel)',
       handler: (invocation) => {
         if (invocation.rawInput.trim().length > 0) return { kind: 'error', text: USAGE }
         return request(invocation)
       },
     })
+    const disposeCancel = ctx.commands.register({
+      name: CANCEL,
+      description: 'Cancel a queued or running manual compaction',
+      handler: (invocation) => {
+        if (invocation.rawInput.trim().length > 0) return { kind: 'error', text: CANCEL_USAGE }
+        return cancel(invocation.agent)
+      },
+    })
     return () => {
-      dispose()
+      disposeCompact()
+      disposeCancel()
       for (const state of live) {
         if (state.timer !== undefined) {
           clearTimeout(state.timer)
@@ -192,6 +234,9 @@ export function apply(ctx, config = {}) {
         if (state.pending !== undefined) {
           state.pending.cancelled = true
           state.pending = undefined
+        }
+        if (state.running !== undefined) {
+          state.running.controller.abort(new Error('compact-enhanced plugin disposed'))
         }
       }
     }
