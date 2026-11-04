@@ -30,7 +30,7 @@ upgrades that command row into the usual compaction card.
 | command | behavior |
 | --- | --- |
 | `/compact` | start now when the agent is idle, otherwise queue until the current turn ends |
-| `/compact-cancel` | drop a queued request, or abort the running summarizer request |
+| `/compact-cancel` | drop a queued request, abort the running summarizer request, or cancel a compaction started by another command module |
 
 Both commands reject arguments. `/compact` refuses a second request while one
 is queued or running and names the cancel command in the error.
@@ -65,9 +65,19 @@ for that id. Clients fold it into the existing row.
   registers its own `/compact` under that name. If a profile still mounts the
   built-in row, the duplicate registration is caught: the plugin logs a warning,
   keeps `/compact-cancel` mounted, and leaves the built-in command in place.
-- A run calls `ctx.compaction.compactNow(agent, signal, commandId)` with an
-  `AbortSignal` this plugin owns. Cancellation aborts that signal, which reaches
-  the summarizer request.
+- The compaction seam is not a profile-root service: agent presets mount it in
+  an isolated per-agent group. The plugin therefore injects only `commands` and
+  resolves `agent.ctx.get('compaction')` per run, falling back to the root
+  service when one exists. Until this was fixed the entry stayed pending
+  forever, waiting for a `compaction` service that only exists inside an agent.
+- Agent presets also register their own scoped `/compact`, which shadows a
+  global replacement for those agents. The plugin handles a `/compact` line at
+  the command service boundary, so the queue applies whichever definition the
+  catalog resolves, and restores the original `execute` method when the plugin
+  unloads.
+- A run calls `compactNow(agent, signal, commandId)` with an `AbortSignal` this
+  plugin owns. Cancellation aborts that signal, which reaches the summarizer
+  request.
 - A start that races a newly opened turn is retried after
   `retryDelayMs`, up to `maxQueueAttempts` times, before the failure is written
   to the row. Queue state is per agent and in memory.
@@ -130,6 +140,12 @@ has to be copied into the profile's `cordis.patch.yml` by hand.
   `/compact` at all, because that layer already disabled the built-in command.
   Re-enable the `command-compact` row in Plugins to get the built-in command
   back.
+- The command-service interception is a method replacement on the `commands`
+  service, removed when the plugin unloads. A future harness release that wraps
+  or freezes that method would need this approach revisited.
+- The fallback cancellation relies on the session log ending in an unfinished
+  `compaction/start` marker; a compaction that crashed without an end marker is
+  reported as active until the next one completes.
 
 ## License
 
