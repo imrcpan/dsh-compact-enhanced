@@ -35,6 +35,11 @@ upgrades that command row into the usual compaction card.
 Both commands reject arguments. `/compact` refuses a second request while one
 is queued or running and names the cancel command in the error.
 
+The cancel row settles once the abort reaches the summarizer: it reads
+`Compaction cancelled.` when the run ended, and `Cancellation requested; the
+summarizer has not stopped yet.` when the run ignored the abort within
+`cancelTimeoutMs`.
+
 ## What the transcript shows
 
 The request's own lifecycle row appears immediately:
@@ -94,6 +99,7 @@ for that id. Clients fold it into the existing row.
 | --- | --- | --- |
 | `retryDelayMs` | `250` | wait before retrying a start that raced a new turn |
 | `maxQueueAttempts` | `40` | start attempts before the queued failure is reported |
+| `cancelTimeoutMs` | `2000` | how long the cancel command waits for the aborted run to settle before reporting a pending request |
 
 Configuration is optional; the bundle layer supplies no config at all.
 
