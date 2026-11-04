@@ -8,6 +8,13 @@ Queueing and cancellation for DeepSeek Harness manual compaction.
 dsh plugin --profile web add github:imrcpan/dsh-compact-enhanced
 ```
 
+```text
+# Run compaction.
+/compact
+# Cancel compaction.
+/compact-cancel
+```
+
 ## Why this exists
 
 The built-in `/compact` command has two limits that hurt on a slow or unstable
