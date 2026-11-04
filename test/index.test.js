@@ -16,6 +16,9 @@ function harness(compactNow, config = {}, options = {}) {
     effect: (factory) => { dispose = factory() },
     logger: { warn: () => {} },
   }
+  if (options.delegate !== undefined) {
+    ctx.commands.find = () => ({ name: 'compact', description: 'scoped builtin', handler: options.delegate })
+  }
   apply(ctx, { retryDelayMs: 5, maxQueueAttempts: 3, ...config })
   const agent = {
     status: 'idle',
@@ -241,6 +244,41 @@ test('reports a missing compaction service instead of hanging', async () => {
   const result = await run('compact', 'cmd-missing')
   assert.equal(result.kind, 'error')
   assert.match(result.text, /Compaction is unavailable/)
+})
+
+test('delegates to the compact definition resolved for the agent', async () => {
+  const calls = []
+  const { agent, run } = harness(async () => { throw new Error('root service must not be used') }, {}, {
+    noService: true,
+    delegate: async (invocation) => {
+      calls.push(invocation)
+      return { kind: 'success', text: 'Compacted 4 history items (~9 tokens).', sourceEventSeq: 5 }
+    },
+  })
+  const result = await run('compact', 'cmd-d1')
+  assert.equal(result.kind, 'success')
+  await flush()
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].commandId, 'cmd-d1')
+  assert.equal(calls[0].agent, agent)
+  assert.equal(agent.appended.at(-1).data.text, 'Compacted 4 history items (~9 tokens).')
+  assert.equal(agent.appended.at(-1).data.sourceEventSeq, 5)
+})
+
+test('cancels a delegated run through its signal', async () => {
+  const { agent, run } = harness(async () => { throw new Error('root service must not be used') }, {}, {
+    noService: true,
+    delegate: (invocation) => new Promise((resolve) => {
+      invocation.signal.addEventListener('abort', () => resolve({ kind: 'error', text: 'Compaction cancelled.' }), { once: true })
+    }),
+  })
+  await run('compact', 'cmd-d2')
+  await flush()
+  const cancelled = await run('compact-cancel', 'cmd-d3')
+  assert.match(cancelled.text, /Cancelling the running/)
+  await flush()
+  assert.equal(agent.appended.at(-1).data.kind, 'error')
+  assert.equal(agent.appended.at(-1).data.text, 'Compaction cancelled.')
 })
 
 test('handles /compact at the command service boundary', async () => {

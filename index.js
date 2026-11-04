@@ -145,9 +145,26 @@ export function apply(ctx, config = {}) {
     return scoped ?? ctx.get('compaction')
   }
 
+  /** The compact definition this plugin registered, so delegation cannot resolve back to itself. */
+  function compactHandler(invocation) {
+    if (invocation.rawInput.trim().length > 0) return { kind: 'error', text: USAGE }
+    return request(invocation)
+  }
+
+  /**
+   * Another module's compact definition for this agent, usually the scoped one an
+   * agent preset mounted inside its isolated group. Its handler closes over the
+   * compaction service and is the only reachable path when the service is not
+   * visible from this plugin's context.
+   */
+  function effectiveCompact(agent) {
+    const definition = ctx.commands.find?.(agent, COMPACT)
+    return definition !== undefined && definition.handler !== compactHandler ? definition : undefined
+  }
+
   function request(invocation) {
     const agent = invocation.agent
-    if (compactionOf(agent) === undefined) {
+    if (effectiveCompact(agent) === undefined && compactionOf(agent) === undefined) {
       return { kind: 'error', text: 'Compaction is unavailable: this session has no compaction service.' }
     }
     const state = stateOf(agent)
@@ -174,6 +191,24 @@ export function apply(ctx, config = {}) {
   /** Start one attempt synchronously so a busy refusal stays distinguishable from a rejection. */
   function begin(agent, state, commandId) {
     const entry = { commandId, controller: new AbortController() }
+    const delegated = effectiveCompact(agent)
+    if (delegated !== undefined) {
+      state.running = entry
+      Promise.resolve()
+        .then(() => delegated.handler({ commandId, agent, rawInput: '', attachments: Object.freeze({}), signal: entry.controller.signal }))
+        .then((result) => {
+          settle(agent, commandId, result ?? { kind: 'error', text: 'Compaction finished without a result.' })
+        }, (error) => {
+          settle(agent, commandId, {
+            kind: 'error',
+            text: entry.controller.signal.aborted ? CANCELLED_TEXT : failureText(error),
+          })
+        })
+        .finally(() => {
+          if (state.running === entry) state.running = undefined
+        })
+      return entry
+    }
     const compaction = compactionOf(agent)
     if (compaction === undefined) throw new Error('Compaction is unavailable: this session has no compaction service.')
     const operation = compaction.compactNow(agent, entry.controller.signal, commandId)
@@ -255,10 +290,7 @@ export function apply(ctx, config = {}) {
       disposers.push(ctx.commands.register({
         name: COMPACT,
         description: 'Compact older conversation history, queued while the agent is busy (stop it with /compact-cancel)',
-        handler: (invocation) => {
-          if (invocation.rawInput.trim().length > 0) return { kind: 'error', text: USAGE }
-          return request(invocation)
-        },
+        handler: compactHandler,
       }))
     } catch (error) {
       // The registry refuses a duplicate global name, so a profile that still
