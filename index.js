@@ -43,6 +43,9 @@ const DEFAULT_RETRY_DELAY_MS = 250
 /** How many times a queued start retries before the failure is reported. */
 const DEFAULT_MAX_QUEUE_ATTEMPTS = 40
 
+/** How long the cancel command waits for an aborted run to settle before reporting a request. */
+const DEFAULT_CANCEL_TIMEOUT_MS = 2000
+
 function resolveSettings(config) {
   const source = config ?? {}
   const retryDelayMs = source.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
@@ -53,7 +56,11 @@ function resolveSettings(config) {
   if (!Number.isInteger(maxQueueAttempts) || maxQueueAttempts < 1) {
     throw new Error('compact-enhanced: maxQueueAttempts must be a positive integer')
   }
-  return { retryDelayMs, maxQueueAttempts }
+  const cancelTimeoutMs = source.cancelTimeoutMs ?? DEFAULT_CANCEL_TIMEOUT_MS
+  if (typeof cancelTimeoutMs !== 'number' || !Number.isFinite(cancelTimeoutMs) || cancelTimeoutMs <= 0) {
+    throw new Error('compact-enhanced: cancelTimeoutMs must be a positive finite number of milliseconds')
+  }
+  return { retryDelayMs, maxQueueAttempts, cancelTimeoutMs }
 }
 
 function delay(ms) {
@@ -191,6 +198,8 @@ export function apply(ctx, config = {}) {
   /** Start one attempt synchronously so a busy refusal stays distinguishable from a rejection. */
   function begin(agent, state, commandId) {
     const entry = { commandId, controller: new AbortController() }
+    let markSettled
+    entry.settled = new Promise((resolve) => { markSettled = resolve })
     const delegated = effectiveCompact(agent)
     if (delegated !== undefined) {
       state.running = entry
@@ -206,6 +215,7 @@ export function apply(ctx, config = {}) {
         })
         .finally(() => {
           if (state.running === entry) state.running = undefined
+          markSettled()
         })
       return entry
     }
@@ -228,6 +238,7 @@ export function apply(ctx, config = {}) {
       })
     }).finally(() => {
       if (state.running === entry) state.running = undefined
+      markSettled()
     })
     return entry
   }
@@ -257,7 +268,7 @@ export function apply(ctx, config = {}) {
   }
 
   /** Stop the queued request or abort the running attempt for one agent. */
-  function cancel(agent) {
+  async function cancel(agent) {
     const state = stateOf(agent)
     if (state.pending !== undefined) {
       const entry = state.pending
@@ -271,8 +282,15 @@ export function apply(ctx, config = {}) {
       return { kind: 'success', text: 'Cancelled the queued compaction.' }
     }
     if (state.running !== undefined) {
-      state.running.controller.abort(new Error('compaction cancelled by the user'))
-      return { kind: 'success', text: 'Cancelling the running compaction.' }
+      const entry = state.running
+      entry.controller.abort(new Error('compaction cancelled by the user'))
+      const finished = await Promise.race([
+        entry.settled.then(() => true),
+        delay(settings.cancelTimeoutMs).then(() => false),
+      ])
+      return finished
+        ? { kind: 'success', text: CANCELLED_TEXT }
+        : { kind: 'success', text: 'Cancellation requested; the summarizer has not stopped yet.' }
     }
     if (agent.status === 'idle' && compactionActive(agent)) {
       // A compaction started by another command module runs in this agent's

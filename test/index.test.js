@@ -152,7 +152,7 @@ test('cancels a running request through its abort signal', async () => {
   await flush()
   const cancelled = await run('compact-cancel', 'cmd-13')
   assert.equal(cancelled.kind, 'success')
-  assert.match(cancelled.text, /Cancelling the running/)
+  assert.equal(cancelled.text, 'Compaction cancelled.')
   await flush()
   assert.equal(seen.aborted, true)
   assert.equal(agent.appended.at(-1).data.kind, 'error')
@@ -275,10 +275,19 @@ test('cancels a delegated run through its signal', async () => {
   await run('compact', 'cmd-d2')
   await flush()
   const cancelled = await run('compact-cancel', 'cmd-d3')
-  assert.match(cancelled.text, /Cancelling the running/)
+  assert.equal(cancelled.text, 'Compaction cancelled.')
   await flush()
   assert.equal(agent.appended.at(-1).data.kind, 'error')
   assert.equal(agent.appended.at(-1).data.text, 'Compaction cancelled.')
+})
+
+test('reports a pending request when the summarizer ignores the abort', async () => {
+  const { run } = harness(() => new Promise(() => {}), { cancelTimeoutMs: 5 })
+  await run('compact', 'cmd-t1')
+  await flush()
+  const cancelled = await run('compact-cancel', 'cmd-t2')
+  assert.equal(cancelled.kind, 'success')
+  assert.match(cancelled.text, /has not stopped yet/)
 })
 
 test('handles /compact at the command service boundary', async () => {
