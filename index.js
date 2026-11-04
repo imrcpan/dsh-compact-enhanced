@@ -72,6 +72,11 @@ function isBusy(error) {
   return typeof error === 'object' && error !== null && error.code === 'busy'
 }
 
+/** Token label in the Claude Code style: one decimal, unit always thousands. */
+function formatTokens(tokens) {
+  return `${(tokens / 1000).toFixed(1)}k token`
+}
+
 /** Parse a `/compact` line; `/compact-cancel` and every other command return undefined. */
 function parseCompact(line) {
   const match = /^\/compact(?=$|[\t\n\r ])/u.exec(line)
@@ -132,6 +137,45 @@ export function apply(ctx, config = {}) {
     return state
   }
 
+  /** Republish the catalog so the status hint refetches after a state change. */
+  function refreshStatus() {
+    try {
+      ctx.commands.notifyChange?.()
+    } catch (error) {
+      ctx.logger.warn('compact-enhanced: commands/change notify failed: %o', error)
+    }
+  }
+
+  /** Current session token estimate, or 0 when no meter is reachable for this agent. */
+  function measuredTokens(agent) {
+    const meter = agent.ctx?.get?.('tokenMeter') ?? ctx.get('tokenMeter')
+    const measurement = meter?.measure?.(agent.session)
+    const total = measurement?.totalTokens
+    return typeof total === 'number' && Number.isFinite(total) && total > 0 ? total : 0
+  }
+
+  /** One-line state for the /compact row: current action plus the context size when known. */
+  function compactStatus(agent) {
+    const state = states.get(agent)
+    const label = state?.running !== undefined
+      ? 'Compacting'
+      : state?.pending !== undefined
+        ? 'Queued'
+        : compactionActive(agent)
+          ? 'Compacting'
+          : 'Ready'
+    const tokens = measuredTokens(agent)
+    return tokens > 0 ? `${label} · ${formatTokens(tokens)}` : label
+  }
+
+  /** One-line state for the /compact-cancel row. */
+  function cancelStatus(agent) {
+    const state = states.get(agent)
+    if (state?.pending !== undefined) return 'Cancel the queued compaction'
+    if (state?.running !== undefined || compactionActive(agent)) return 'Cancel the running compaction'
+    return 'No queued or running compaction to cancel'
+  }
+
   /** Append the second lifecycle edge for one attempt: the queue outlives command/run. */
   function settle(agent, commandId, result) {
     try {
@@ -144,6 +188,7 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       ctx.logger.warn('compact-enhanced: command/done append failed: %o', error)
     }
+    refreshStatus()
   }
 
   /** Resolve the per-agent compaction seam: presets isolate it below the profile root. */
@@ -187,6 +232,7 @@ export function apply(ctx, config = {}) {
       state.timer = undefined
       void drain(agent, state)
     }, 0)
+    refreshStatus()
     return {
       kind: 'success',
       text: agent.status === 'idle'
@@ -203,6 +249,7 @@ export function apply(ctx, config = {}) {
     const delegated = effectiveCompact(agent)
     if (delegated !== undefined) {
       state.running = entry
+      refreshStatus()
       Promise.resolve()
         .then(() => delegated.handler({ commandId, agent, rawInput: '', attachments: Object.freeze({}), signal: entry.controller.signal }))
         .then((result) => {
@@ -223,6 +270,7 @@ export function apply(ctx, config = {}) {
     if (compaction === undefined) throw new Error('Compaction is unavailable: this session has no compaction service.')
     const operation = compaction.compactNow(agent, entry.controller.signal, commandId)
     state.running = entry
+    refreshStatus()
     Promise.resolve(operation).then((result) => {
       settle(agent, commandId, {
         kind: 'success',
@@ -288,6 +336,7 @@ export function apply(ctx, config = {}) {
         entry.settled.then(() => true),
         delay(settings.cancelTimeoutMs).then(() => false),
       ])
+      refreshStatus()
       return finished
         ? { kind: 'success', text: CANCELLED_TEXT }
         : { kind: 'success', text: 'Cancellation requested; the summarizer has not stopped yet.' }
@@ -297,6 +346,7 @@ export function apply(ctx, config = {}) {
       // maintenance phase; cancelling the phase aborts it without clearing the
       // queued inbox work.
       agent.cancel({ kind: 'user' }, { keepInbox: true })
+      refreshStatus()
       return { kind: 'success', text: 'Cancellation requested for the active compaction.' }
     }
     return { kind: 'error', text: 'No queued or running compaction to cancel.' }
@@ -330,7 +380,7 @@ export function apply(ctx, config = {}) {
     const service = ctx.commands
     const originalExecute = service.execute
     let sequence = 0
-    const execute = typeof originalExecute !== 'function' ? undefined : async (agent, line, attachments, signal) => {
+    const execute = originalExecute === undefined ? undefined : async (agent, line, attachments, signal) => {
       const parsed = parseCompact(line)
       if (parsed === undefined) return originalExecute.call(service, agent, line, attachments, signal)
       const commandId = `cmd-compact-enhanced-${randomUUID().slice(0, 8)}-${++sequence}`
@@ -349,8 +399,24 @@ export function apply(ctx, config = {}) {
       return { commandId, result }
     }
     if (execute !== undefined) service.execute = execute
+    // The catalog feeds the slash-menu hint. Replacing the compact descriptor
+    // with a status line (and dropping its builtin id so the client cannot
+    // re-localize it) is what surfaces queue and compaction state at a glance.
+    const originalList = service.list
+    const list = typeof originalList !== 'function' ? undefined : (agent) => {
+      const descriptors = originalList.call(service, agent)
+      const compactIndex = descriptors.findIndex((descriptor) => descriptor.name === COMPACT)
+      const cancelIndex = descriptors.findIndex((descriptor) => descriptor.name === CANCEL)
+      if (compactIndex === -1 && cancelIndex === -1) return descriptors
+      const next = descriptors.slice()
+      if (compactIndex !== -1) next[compactIndex] = Object.freeze({ name: COMPACT, description: compactStatus(agent) })
+      if (cancelIndex !== -1) next[cancelIndex] = Object.freeze({ name: CANCEL, description: cancelStatus(agent) })
+      return next
+    }
+    if (list !== undefined) service.list = list
     return () => {
       if (execute !== undefined && service.execute === execute) service.execute = originalExecute
+      if (list !== undefined && service.list === list) service.list = originalList
       for (const dispose of disposers) dispose()
       for (const state of live) {
         if (state.timer !== undefined) {

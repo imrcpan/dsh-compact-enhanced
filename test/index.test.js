@@ -6,13 +6,25 @@ import { apply, inject, name } from '../index.js'
 function harness(compactNow, config = {}, options = {}) {
   const definitions = new Map()
   let dispose
+  let catalogChanges = 0
   const originalExecute = async () => 'delegated'
+  const tokenMeter = { measure: () => ({ totalTokens: options.tokens ?? 0 }) }
   const ctx = {
     commands: {
       execute: originalExecute,
       register: (definition) => { definitions.set(definition.name, definition); return () => definitions.delete(definition.name) },
+      notifyChange: () => { catalogChanges += 1 },
+      list: () => [
+        { name: 'compact', definitionId: '@deepseek-ai/dsh-command-compact', description: 'Compact older conversation history' },
+        { name: 'compact-cancel', description: 'Cancel a queued or running manual compaction' },
+        { name: 'other', definitionId: 'other/definition', description: 'Another command' },
+      ],
     },
-    get: (service) => (service === 'compaction' && options.noService !== true ? { compactNow } : undefined),
+    get: (service) => {
+      if (service === 'compaction') return options.noService === true ? undefined : { compactNow }
+      if (service === 'tokenMeter') return options.noMeter === true ? undefined : tokenMeter
+      return undefined
+    },
     effect: (factory) => { dispose = factory() },
     logger: { warn: () => {} },
   }
@@ -48,7 +60,9 @@ function harness(compactNow, config = {}, options = {}) {
     signal: new AbortController().signal,
   })
   const execute = (line) => ctx.commands.execute(agent, line, [], new AbortController().signal)
-  return { definitions, dispose: () => dispose(), agent, run, execute, ctx }
+  const catalog = () => ctx.commands.list(agent)
+  const changes = () => catalogChanges
+  return { definitions, dispose: () => dispose(), agent, run, execute, catalog, changes, ctx }
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 30))
@@ -183,6 +197,61 @@ test('does not cancel while a finished compaction is only history', async () => 
   const result = await run('compact-cancel', 'cmd-14c')
   assert.equal(result.kind, 'error')
   assert.equal(agent.cancelCalls.length, 0)
+})
+
+test('shows the ready state and token count in the catalog', () => {
+  const { catalog } = harness(async () => null, {}, { tokens: 3900 })
+  const rows = catalog()
+  const compact = rows.find((row) => row.name === 'compact')
+  assert.equal(compact.description, 'Ready · 3.9k token')
+  assert.equal('definitionId' in compact, false)
+  const cancel = rows.find((row) => row.name === 'compact-cancel')
+  assert.equal(cancel.description, 'No queued or running compaction to cancel')
+  const other = rows.find((row) => row.name === 'other')
+  assert.equal(other.definitionId, 'other/definition')
+  assert.equal(other.description, 'Another command')
+})
+
+test('formats tokens with one decimal and a fixed k unit', () => {
+  const expected = [[12345, '12.3k token'], [900, '0.9k token'], [1000, '1.0k token']]
+  for (const [tokens, label] of expected) {
+    const { catalog } = harness(async () => null, {}, { tokens })
+    assert.equal(catalog().find((row) => row.name === 'compact').description, `Ready · ${label}`)
+  }
+})
+
+test('omits the token count when it is zero or the meter is missing', () => {
+  const zero = harness(async () => null, {}, { tokens: 0 })
+  assert.equal(zero.catalog().find((row) => row.name === 'compact').description, 'Ready')
+  const noMeter = harness(async () => null, {}, { noMeter: true })
+  assert.equal(noMeter.catalog().find((row) => row.name === 'compact').description, 'Ready')
+})
+
+test('shows queued and compacting states in the catalog', async () => {
+  const { agent, run, catalog } = harness(async () => new Promise(() => {}), {}, { tokens: 2000 })
+  agent.goBusy()
+  await run('compact', 'cmd-state-1')
+  assert.equal(catalog().find((row) => row.name === 'compact').description, 'Queued · 2.0k token')
+  assert.equal(catalog().find((row) => row.name === 'compact-cancel').description, 'Cancel the queued compaction')
+  agent.goIdle()
+  await flush()
+  assert.equal(catalog().find((row) => row.name === 'compact').description, 'Compacting · 2.0k token')
+  assert.equal(catalog().find((row) => row.name === 'compact-cancel').description, 'Cancel the running compaction')
+})
+
+test('prefers the agent-scoped token meter for the status line', () => {
+  const { agent, catalog } = harness(async () => null, {}, { tokens: 3900 })
+  agent.ctx = { get: (service) => (service === 'tokenMeter' ? { measure: () => ({ totalTokens: 5000 }) } : undefined) }
+  assert.equal(catalog().find((row) => row.name === 'compact').description, 'Ready · 5.0k token')
+})
+
+test('republishes the catalog when the compaction state changes', async () => {
+  const { agent, run, changes } = harness(async () => ({ shadowedSeqs: [1], shadowedTokenCount: 3 }))
+  const before = changes()
+  await run('compact', 'cmd-changes')
+  await flush()
+  assert.ok(changes() > before)
+  assert.ok(agent.appended.length > 0)
 })
 
 test('maps documented compaction failures to human text', async () => {
